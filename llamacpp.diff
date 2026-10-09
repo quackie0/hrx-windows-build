@@ -1,0 +1,161 @@
+diff --git a/ggml/src/ggml-hrx/CMakeLists.txt b/ggml/src/ggml-hrx/CMakeLists.txt
+index b3eb70120..684d396df 100644
+--- a/ggml/src/ggml-hrx/CMakeLists.txt
++++ b/ggml/src/ggml-hrx/CMakeLists.txt
+@@ -300,6 +300,20 @@ target_link_libraries(ggml-hrx PRIVATE ggml-hrx-kernel-corpus hrx::hrx loomc::lo
+ target_include_directories(ggml-hrx PRIVATE . "${CMAKE_CURRENT_BINARY_DIR}" ../../../vendor)
+ target_compile_definitions(ggml-hrx PRIVATE GGML_USE_HRX)
+ 
++# Sources the offline analysis tool (ggml-hrx-analyze-graph) needs. Derived from
++# the backend's own source list so the two cannot drift: everything under
++# graph/, dispatch/ and dispatch_registration/ is pure graph/dispatch logic with
++# no device or runtime dependency, whereas ggml-hrx.cpp, loom-jit.cpp and
++# runtime/ are the parts that actually touch hrx/loomc devices and the backend
++# registration entry points.
++get_target_property(GGML_HRX_BACKEND_SOURCES ggml-hrx SOURCES)
++set(GGML_HRX_ANALYSIS_SOURCES "")
++foreach(_source IN LISTS GGML_HRX_BACKEND_SOURCES)
++    if(_source MATCHES "^graph/" OR _source MATCHES "^dispatch/" OR _source MATCHES "^dispatch_registration/")
++        list(APPEND GGML_HRX_ANALYSIS_SOURCES "${_source}")
++    endif()
++endforeach()
++
+ if (GGML_HRX_BUNDLE_RUNTIME_LIBS)
+     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleRuntime.cmake")
+     ggml_hrx_bundle_runtime(ggml-hrx)
+@@ -314,9 +328,24 @@ target_link_libraries(ggml-hrx-compile-kernel PRIVATE hrx::hrx loomc::loomc)
+ target_include_directories(ggml-hrx-compile-kernel PRIVATE .)
+ target_compile_features(ggml-hrx-compile-kernel PRIVATE cxx_std_17)
+ 
++# This tool is an in-tree developer utility, not a plugin consumer: it links the
++# backend's internal ggml::hrx:: graph/dispatch/command APIs directly. Those are
++# deliberately not part of the ggml-hrx export surface (only the GGML_BACKEND_API
++# entry points are), so on Windows they cannot be reached through the import
++# library and the link fails with "undefined symbol: ggml::hrx::...". ELF/Mach-O
++# import libraries still carry those definitions, which is why this only ever
++# failed on Windows. Compile the defining sources into the tool instead, matching
++# how ggml-hrx-compile-kernel above already avoids linking the backend DLL.
+ add_executable(ggml-hrx-analyze-graph
+     tools/analyze-graph.cpp
++    ${GGML_HRX_ANALYSIS_SOURCES}
++)
++target_link_libraries(ggml-hrx-analyze-graph PRIVATE ggml ggml-hrx-kernel-corpus hrx::hrx loomc::loomc)
++target_include_directories(ggml-hrx-analyze-graph PRIVATE
++    .
++    ../../../vendor
++    ${CMAKE_CURRENT_SOURCE_DIR}/..      # ggml-impl.h
++    ${CMAKE_CURRENT_BINARY_DIR}         # generated kernel corpus catalog headers
+ )
+-target_link_libraries(ggml-hrx-analyze-graph PRIVATE ggml-hrx ggml ggml-hrx-kernel-corpus)
+-target_include_directories(ggml-hrx-analyze-graph PRIVATE . ../../../vendor)
++target_compile_definitions(ggml-hrx-analyze-graph PRIVATE GGML_USE_HRX)
+ target_compile_features(ggml-hrx-analyze-graph PRIVATE cxx_std_17)
+diff --git a/ggml/src/ggml-hrx/backend-context.h b/ggml/src/ggml-hrx/backend-context.h
+index 3d510b310..0a4a96d8a 100644
+--- a/ggml/src/ggml-hrx/backend-context.h
++++ b/ggml/src/ggml-hrx/backend-context.h
+@@ -67,10 +67,9 @@ struct ggml_backend_hrx_context {
+     std::string                            name;
+ };
+ 
++// Never destroyed: teardown calls hrx_gpu_shutdown() during process exit, which
++// waits on terminated runtime threads and hangs. See ggml_backend_hrx_reg().
+ struct ggml_backend_hrx_reg_context {
+-    bool                                                          initialized = false;
+     std::vector<std::unique_ptr<ggml_backend_hrx_device_context>> device_contexts;
+     std::vector<ggml_backend_device>                              devices;
+-
+-    ~ggml_backend_hrx_reg_context();
+ };
+diff --git a/ggml/src/ggml-hrx/ggml-hrx.cpp b/ggml/src/ggml-hrx/ggml-hrx.cpp
+index 81ecb97e5..3cfbb736a 100644
+--- a/ggml/src/ggml-hrx/ggml-hrx.cpp
++++ b/ggml/src/ggml-hrx/ggml-hrx.cpp
+@@ -76,23 +76,6 @@ static bool hrx_check(hrx_status_t status, const char * expression, const char *
+ 
+ }  // namespace
+ 
+-ggml_backend_hrx_reg_context::~ggml_backend_hrx_reg_context() {
+-    for (auto & context : device_contexts) {
+-        if (context->buffer_stream != nullptr) {
+-            hrx_stream_release(context->buffer_stream);
+-        }
+-        if (context->device != nullptr) {
+-            hrx_device_release(context->device);
+-        }
+-    }
+-    if (initialized) {
+-        hrx_status_t status = hrx_gpu_shutdown();
+-        if (!hrx_status_is_ok(status)) {
+-            hrx_status_ignore(status);
+-        }
+-    }
+-}
+-
+ namespace {
+ 
+ static std::optional<std::string> device_string_property(hrx_device_t          device,
+@@ -1113,14 +1096,13 @@ static std::unique_ptr<ggml_backend_hrx_reg_context> create_registry_context() {
+             return context;
+         }
+     }
+-    hrx_status_t status  = hrx_gpu_initialize(0);
+-    if (hrx_status_is_ok(status)) {
+-        context->initialized = true;
+-    } else if (hrx_status_code(status) == HRX_STATUS_ALREADY_EXISTS) {
+-        hrx_status_ignore(status);
+-    } else {
++    hrx_status_t status = hrx_gpu_initialize(0);
++    if (!hrx_status_is_ok(status)) {
++        const bool already_initialized = hrx_status_code(status) == HRX_STATUS_ALREADY_EXISTS;
+         hrx_status_ignore(status);
+-        return context;
++        if (!already_initialized) {
++            return context;
++        }
+     }
+     int count = 0;
+     if (!HRX_CHECK(hrx_gpu_device_count(&count))) {
+@@ -1177,8 +1159,13 @@ static std::unique_ptr<ggml_backend_hrx_reg_context> create_registry_context() {
+ }  // namespace
+ 
+ ggml_backend_reg_t ggml_backend_hrx_reg() {
+-    static std::unique_ptr<ggml_backend_hrx_reg_context> context = create_registry_context();
+-    static ggml_backend_reg registry = { GGML_BACKEND_API_VERSION, registry_i, context.get() };
++    // Intentionally leak the registry context. Its destructor calls
++    // hrx_gpu_shutdown(), which waits for runtime threads. On Windows the
++    // destructor runs from the DLL detach handler at process exit, after
++    // ExitProcess has terminated those threads, so the process hangs. WebGPU
++    // leaks its registry context for the same reason.
++    static ggml_backend_hrx_reg_context * context = create_registry_context().release();
++    static ggml_backend_reg registry = { GGML_BACKEND_API_VERSION, registry_i, context };
+     for (auto & device : context->devices) {
+         device.reg = &registry;
+     }
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index 62b76abbc..4811e194c 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -229,14 +229,18 @@ struct ggml_hash_set {
+     struct ggml_tensor ** keys; // actual tensors in the set, keys[i] is only defined if ggml_bitset_get(used, i)
+ };
+ 
+-struct ggml_hash_set ggml_hash_set_new(size_t size);
+-void                 ggml_hash_set_free(struct ggml_hash_set * hash_set);
++// These are exported so that out-of-tree backends built as separate shared
++// libraries (e.g. ggml-hrx) can link them. Without GGML_API they are private
++// to ggml-base on Windows, where only explicitly exported symbols cross a DLL
++// boundary, and the link fails with "undefined symbol: ggml_hash_set_new".
++GGML_API struct ggml_hash_set ggml_hash_set_new(size_t size);
++GGML_API void                 ggml_hash_set_free(struct ggml_hash_set * hash_set);
+ 
+ // returns the minimum size for a hash set that can hold min_sz elements
+-size_t ggml_hash_size(size_t min_sz);
++GGML_API size_t ggml_hash_size(size_t min_sz);
+ 
+ // remove all elements from the hash set
+-void ggml_hash_set_reset(struct ggml_hash_set * hash_set);
++GGML_API void ggml_hash_set_reset(struct ggml_hash_set * hash_set);
+ 
+ // returns true if key is in the hash set
+ static bool ggml_hash_contains(const struct ggml_hash_set * hash_set, struct ggml_tensor * key);

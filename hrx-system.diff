@@ -1,0 +1,13 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fbd2f3192b..9b39e73d99 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -65,6 +65,8 @@ endif()
+ 
+ option(BUILD_SHARED_LIBS
+   "Instructs CMake to build libraries as shared if possible." OFF)
++# set to OFF to avoid loomc internal targets export bug
++set(BUILD_SHARED_LIBS OFF)
+ option(IREE_VISIBILITY_HIDDEN "Builds C/C++ libraries with hidden visibility." ON)
+ option(IREE_ENABLE_POSITION_INDEPENDENT_CODE
+   "Enable position independent code." TRUE)

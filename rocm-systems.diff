@@ -1,0 +1,169 @@
+diff --git a/projects/rocr-runtime/libhsakmt/src/dxg/openclose.cpp b/projects/rocr-runtime/libhsakmt/src/dxg/openclose.cpp
+index 494768ece04..6d36e21cf43 100644
+--- a/projects/rocr-runtime/libhsakmt/src/dxg/openclose.cpp
++++ b/projects/rocr-runtime/libhsakmt/src/dxg/openclose.cpp
+@@ -716,11 +716,24 @@ static HSAKMT_STATUS init_vars_from_env(void) {
+     }
+   }
+ 
+-  // Determine SVM (Shared Virtual Memory) API support. Enabled by default unless
+-  // HSA_USE_SVM is explicitly set to "0". Currently forced to false.
++  // Determine SVM (Shared Virtual Memory) API support. Off unless the process
++  // opts in with HSA_USE_SVM=1.
++  //
++  // The DXG (WDDM) backend has no KFD SVM ioctls, cannot enable XNACK, and does
++  // not track residency, so advertising SVM is a capability claim this backend
++  // can only partly back: the attribute surface accepts hints and ignores them,
++  // and queries answer with coarse-grained facts (see svm.cpp). Opting in is
++  // what lets a process reach the consumers of
++  // HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED - the IREE/HRX AMDGPU HAL refuses to
++  // initialize without it - and it is deliberately per process so that clients
++  // which would act on the claim (the HIP runtime sets its HMM flag from it)
++  // can be kept on the default answer.
++  //
++  // Unset or HSA_USE_SVM=0 keeps the stock Windows behavior: SVM reported
++  // unsupported, so every SVM entry point stays unreachable.
+   envvar = getenv("HSA_USE_SVM");
+   dxg_runtime->is_svm_api_supported =
+-      !(envvar && envvar[0] == '0' && envvar[1] == '\0') && false;
++      (envvar != nullptr) && !(envvar[0] == '0' && envvar[1] == '\0');
+ 
+   if ((envvar = getenv("HSAKMT_DEBUG_SYSMEM")) != nullptr) {
+     dxg_runtime->hsakmt_debug_sysmem = safe_env_to_int(envvar, 0);
+diff --git a/projects/rocr-runtime/libhsakmt/src/dxg/svm.cpp b/projects/rocr-runtime/libhsakmt/src/dxg/svm.cpp
+index f2f8a10f682..f4ab44694b1 100644
+--- a/projects/rocr-runtime/libhsakmt/src/dxg/svm.cpp
++++ b/projects/rocr-runtime/libhsakmt/src/dxg/svm.cpp
+@@ -25,22 +25,106 @@
+ 
+ /* Helper functions for calling KFD SVM ioctl */
+ 
++/*
++ * Windows/DXG SVM attribute surface.
++ *
++ * Linux implements these calls with the KFD SVM ioctls, which give the kernel
++ * driver authority over residency, migration and page access. DXG (WDDM) has no
++ * equivalent: the KMD owns residency and there is no user-mode request for
++ * migration or XNACK. Instead of failing every request, the attribute surface is
++ * served as a documented no-op:
++ *
++ *   - SetAttr accepts advice (read-mostly, preferred location, access grants,
++ *     migration granularity) and ignores it; residency stays whatever the KMD
++ *     chose and nothing is migrated or made coherent.
++ *   - GetAttr answers with the coarse-grained facts this backend can actually
++ *     guarantee: host access is available, fine-grained coherency is not, there
++ *     is no migration granularity, and no residency is tracked.
++ *
++ * This exists so HSA clients that consult HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED
++ * (CLR sets its HMM flag from it) see one consistent answer instead of a
++ * "supported" capability whose calls all fail. It is reachable only when the
++ * process opted in with HSA_USE_SVM=1; unset or HSA_USE_SVM=0 keeps the backend
++ * reporting SVM as unsupported and never calls into here.
++ *
++ * This does not implement SVM. There are no page migrations, no fault-driven
++ * residency and no fine-grained coherence, so an application that depends on
++ * those semantics is wrong here even though these calls succeed.
++ */
++
++// Applies the conservative answer to one query slot. Mirrors the attribute
++// convention the HSA layer expects in Runtime::GetSvmAttrib
++// (runtime/hsa-runtime/core/runtime/runtime.cpp): the SET_FLAGS and CLR_FLAGS
++// slots carry the flags that are in effect and the flags that are not, and the
++// ACCESS slot's type reports the resulting access mode.
++static void dxgSvmFillQuery(HSA_SVM_ATTRIBUTE *attr) {
++  switch (attr->type) {
++    case HSA_SVM_ATTR_SET_FLAGS:
++      // The host can reach the allocation: it is CPU-visible by construction on
++      // this backend. Nothing else is granted - no coherency, no read-mostly
++      // replication, no GPU execution, no hive locality.
++      attr->value = HSA_SVM_FLAG_HOST_ACCESS;
++      break;
++    case HSA_SVM_ATTR_CLR_FLAGS:
++      // Fine-grained coherency is the flag this backend never has, which is
++      // also what makes the reported global flag coarse-grained.
++      attr->value = HSA_SVM_FLAG_COHERENT;
++      break;
++    case HSA_SVM_ATTR_ACCESS:
++    case HSA_SVM_ATTR_ACCESS_IN_PLACE:
++    case HSA_SVM_ATTR_NO_ACCESS:
++      // No per-range access tracking: the allocation is reachable by the queried
++      // agent, and in-place (fine-grained) access is not guaranteed, so report
++      // plain accessibility rather than the stronger in-place mode.
++      attr->type = HSA_SVM_ATTR_ACCESS;
++      break;
++    case HSA_SVM_ATTR_PREFERRED_LOC:
++    case HSA_SVM_ATTR_PREFETCH_LOC:
++      // Residency is not tracked and no prefetch can be issued, so report system
++      // memory (node 0) instead of inventing a device residency.
++      attr->value = 0;
++      break;
++    case HSA_SVM_ATTR_GRANULARITY:
++      // Nothing migrates, so there is no migration granularity to report.
++      attr->value = 0;
++      break;
++    default:
++      // Unknown query type: leave the caller's value untouched.
++      break;
++  }
++}
++
+ HSAKMT_STATUS HSAKMTAPI hsaKmtSVMSetAttr(void *start_addr, HSAuint64 size,
+                                          unsigned int nattr,
+                                          HSA_SVM_ATTRIBUTE *attrs) {
+   CHECK_DXG_OPEN();
+-  pr_warn_once("not supported\n");
+-  return HSAKMT_STATUS_NOT_SUPPORTED;
++  if (start_addr == nullptr || nattr == 0 || attrs == nullptr) {
++    return HSAKMT_STATUS_INVALID_PARAMETER;
++  }
++  (void)size;
++  // One breadcrumb per process so a trace shows why SVM calls are succeeding
++  // without any migration happening.
++  pr_warn_once("DXG SVM attribute hints are accepted and ignored (HSA_USE_SVM opt-in)\n");
++  return HSAKMT_STATUS_SUCCESS;
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI hsaKmtSVMGetAttr(void *start_addr, HSAuint64 size,
+                                          unsigned int nattr,
+                                          HSA_SVM_ATTRIBUTE *attrs) {
+   CHECK_DXG_OPEN();
+-  pr_warn_once("not supported\n");
+-  return HSAKMT_STATUS_NOT_SUPPORTED;
++  if (start_addr == nullptr || nattr == 0 || attrs == nullptr) {
++    return HSAKMT_STATUS_INVALID_PARAMETER;
++  }
++  (void)size;
++  for (unsigned int i = 0; i < nattr; ++i) {
++    dxgSvmFillQuery(&attrs[i]);
++  }
++  return HSAKMT_STATUS_SUCCESS;
+ }
+ 
++// XNACK mode is deliberately not part of the opt-in above. It is an execution
++// mode of the device (page-fault driven residency), not advice: reporting
++// success would tell clients that faulting works when the KMD cannot provide it.
+ HSAKMT_STATUS HSAKMTAPI hsaKmtSetXNACKMode(HSAint32 enable) {
+   CHECK_DXG_OPEN();
+   pr_warn_once("not supported\n");
+diff --git a/projects/rocr-runtime/libhsakmt/src/dxg/topology.cpp b/projects/rocr-runtime/libhsakmt/src/dxg/topology.cpp
+index b27f794e747..e2fd57c7f5b 100644
+--- a/projects/rocr-runtime/libhsakmt/src/dxg/topology.cpp
++++ b/projects/rocr-runtime/libhsakmt/src/dxg/topology.cpp
+@@ -977,9 +977,14 @@ HSAKMT_STATUS topology_sysfs_get_node_props(uint32_t node_id, HsaNodeProperties&
+   snprintf(reinterpret_cast<char*>(props.AMDName), sizeof(props.AMDName) - 1, "GFX%06x",
+            HSA_GET_GFX_VERSION_FULL(props.EngineId.ui32));
+ 
+-  if (!dxg_runtime->is_svm_api_supported) {
+-    props.Capability.ui32.SVMAPISupported = 0;
+-  }
++  // Report the process-wide SVM API capability on the node. This bit is the
++  // only input to HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED (see Runtime::GetSystemInfo
++  // in runtime/hsa-runtime/core/runtime/runtime.cpp), which the IREE/HRX AMDGPU
++  // HAL treats as a hard requirement. Stock Windows builds leave it clear;
++  // HSA_USE_SVM=1 (init_vars_from_env in openclose.cpp) opts the process in to
++  // the hint-only attribute surface implemented in svm.cpp.
++  props.Capability.ui32.SVMAPISupported =
++      dxg_runtime->is_svm_api_supported ? 1 : 0;
+   props.Capability.ui32.DoorbellType = 2;
+ 
+   // Get VGPR/SGPR size in byte per CU
